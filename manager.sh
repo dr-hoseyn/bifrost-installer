@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ============================================================
+# Bifrost Manager (Clean & Pro)
+# - Install/Update
+# - Configure YAML (listen_ip/src_ip/dst_ip/address/protocol)
+# - Edit config in nano
+# - systemd service (runs as root; required by bifrost)
+# ============================================================
+
 # -------------------------
 # Repo settings
 # -------------------------
@@ -13,20 +21,36 @@ REPO_DIR="/opt/bifrost-installer"
 # -------------------------
 INSTALL_DIR="/opt/bifrost"
 SERVICE_NAME="bifrost"
-APP_USER="bifrost"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# Config location inside installed files
 CONFIG_DIR="${INSTALL_DIR}/configs"
-CONFIG_FILE_NAME="config.yaml"   # <-- change if needed
+CONFIG_FILE_NAME="config.yaml"        # change if needed
 CONFIG_FILE="${CONFIG_DIR}/${CONFIG_FILE_NAME}"
 
+BIN_PATH="${INSTALL_DIR}/bifrost"
+
+# Address presets
+ADDRESS_IR="10.10.0.1/24"
+ADDRESS_OUT="10.10.0.2/24"
+
 # -------------------------
-# Helpers
+# UI helpers
 # -------------------------
+HR="----------------------------------------"
+
+say()   { echo -e "$*"; }
+ok()    { echo -e "✅ $*"; }
+warn()  { echo -e "⚠️  $*"; }
+err()   { echo -e "❌ $*" >&2; }
+
+pause() {
+  echo
+  read -rp "Press Enter to continue..." _ </dev/tty || true
+}
+
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    echo "ERROR: Run as root:"
+    err "Run as root:"
     echo "  sudo bash manager.sh"
     exit 1
   fi
@@ -34,9 +58,65 @@ require_root() {
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-pause() {
-  echo
-  read -rp "Press Enter to continue..." _ </dev/tty || true
+# -------------------------
+# System helpers
+# -------------------------
+ensure_deps() {
+  require_root
+  if ! need_cmd git; then
+    say "Installing git..."
+    apt-get update -y
+    apt-get install -y git
+  fi
+
+  # for public ip detection
+  if ! need_cmd curl && ! need_cmd wget; then
+    say "Installing curl..."
+    apt-get update -y
+    apt-get install -y curl
+  fi
+
+  # nano for edit option
+  if ! need_cmd nano; then
+    say "Installing nano..."
+    apt-get update -y
+    apt-get install -y nano
+  fi
+
+  # python3 optional for safer edits; sed fallback used if missing
+  if ! need_cmd python3; then
+    warn "python3 not found. Will use sed for config updates (still OK)."
+  fi
+}
+
+sync_repo() {
+  ensure_deps
+  if [ -d "$REPO_DIR/.git" ]; then
+    say "Syncing repository (pull latest)..."
+    git -C "$REPO_DIR" fetch --all --prune
+    git -C "$REPO_DIR" reset --hard "origin/$BRANCH"
+  else
+    say "Cloning repository..."
+    rm -rf "$REPO_DIR"
+    git clone --branch "$BRANCH" "https://github.com/$REPO.git" "$REPO_DIR"
+  fi
+}
+
+get_public_ip() {
+  local ip=""
+  if need_cmd curl; then
+    ip="$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+    [ -n "$ip" ] || ip="$(curl -4 -fsS --max-time 3 https://ifconfig.me 2>/dev/null || true)"
+  fi
+  if [ -z "$ip" ] && need_cmd wget; then
+    ip="$(wget -qO- --timeout=3 https://api.ipify.org 2>/dev/null || true)"
+    [ -n "$ip" ] || ip="$(wget -qO- --timeout=3 https://ifconfig.me 2>/dev/null || true)"
+  fi
+  # last resort: outward interface ip (might be private)
+  if [ -z "$ip" ] && need_cmd ip; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1 || true)"
+  fi
+  echo "$ip"
 }
 
 service_status_short() {
@@ -48,13 +128,13 @@ service_status_short() {
 }
 
 current_version() {
-  if [ -x "${INSTALL_DIR}/bifrost" ]; then
-    if "${INSTALL_DIR}/bifrost" --version >/dev/null 2>&1; then
-      "${INSTALL_DIR}/bifrost" --version 2>/dev/null | head -n 1
+  if [ -x "$BIN_PATH" ]; then
+    if "$BIN_PATH" --version >/dev/null 2>&1; then
+      "$BIN_PATH" --version 2>/dev/null | head -n 1
       return
     fi
-    if "${INSTALL_DIR}/bifrost" -v >/dev/null 2>&1; then
-      "${INSTALL_DIR}/bifrost" -v 2>/dev/null | head -n 1
+    if "$BIN_PATH" -v >/dev/null 2>&1; then
+      "$BIN_PATH" -v 2>/dev/null | head -n 1
       return
     fi
     echo "Installed (version unknown)"
@@ -63,218 +143,69 @@ current_version() {
   fi
 }
 
-ensure_deps() {
-  if ! need_cmd git; then
-    apt-get update -y
-    apt-get install -y git
-  fi
-
-  # for auto public ip (tries curl/wget/dig)
-  if ! need_cmd curl && ! need_cmd wget; then
-    apt-get update -y
-    apt-get install -y curl
-  fi
-
-  # python3 optional (safer editing); sed fallback exists
-  true
-}
-
-sync_repo() {
-  ensure_deps
-  if [ -d "$REPO_DIR/.git" ]; then
-    git -C "$REPO_DIR" fetch --all --prune
-    git -C "$REPO_DIR" reset --hard "origin/$BRANCH"
-  else
-    rm -rf "$REPO_DIR"
-    git clone --branch "$BRANCH" "https://github.com/$REPO.git" "$REPO_DIR"
-  fi
-}
-
-ensure_user() {
-  if ! id -u "$APP_USER" >/dev/null 2>&1; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin "$APP_USER"
-  fi
-}
-
-# Try to discover server public IPv4
-get_public_ip() {
-  local ip=""
-  if need_cmd curl; then
-    ip="$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
-    [ -n "$ip" ] || ip="$(curl -4 -fsS --max-time 3 https://ifconfig.me 2>/dev/null || true)"
-  fi
-  if [ -z "$ip" ] && need_cmd wget; then
-    ip="$(wget -qO- --timeout=3 https://api.ipify.org 2>/dev/null || true)"
-    [ -n "$ip" ] || ip="$(wget -qO- --timeout=3 https://ifconfig.me 2>/dev/null || true)"
-  fi
-  if [ -z "$ip" ] && need_cmd dig; then
-    ip="$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | tail -n 1 || true)"
-  fi
-  # last resort: outward interface IP (might be private)
-  if [ -z "$ip" ] && need_cmd ip; then
-    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1 || true)"
-  fi
-  echo "$ip"
-}
-
-# Read current values from config (best effort)
-read_config_value() {
-  local key="$1"
-  local file="$2"
-  if [ ! -f "$file" ]; then
-    echo ""
-    return
-  fi
+# -------------------------
+# YAML helpers (safe-ish)
+# -------------------------
+read_yaml_value() {
+  local key="$1" file="$2"
+  [ -f "$file" ] || { echo ""; return; }
   grep -E "^[[:space:]]*${key}:" "$file" | head -n 1 | sed -E 's/^[[:space:]]*[^:]+:[[:space:]]*//; s/"//g; s/[[:space:]]+$//'
 }
 
-# Update YAML keys (listen_ip/src_ip/dst_ip).
-update_config_keys() {
-  local file="$1"
-  local listen_ip="$2"
-  local src_ip="$3"
-  local dst_ip="$4"
+backup_config() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  cp -a "$CONFIG_FILE" "${CONFIG_FILE}.bak-${ts}"
+  ok "Backup created: ${CONFIG_FILE}.bak-${ts}"
+}
 
-  if [ ! -f "$file" ]; then
-    echo "ERROR: Config file not found: $file"
-    return 1
+# Set or add a top-level key (best effort)
+# Works when the key appears once in the file.
+set_yaml_kv() {
+  local key="$1" value="$2" file="$3" quoted="${4:-yes}"   # quoted yes/no
+  local val
+  if [ "$quoted" = "yes" ]; then
+    val="\"${value}\""
+  else
+    val="${value}"
   fi
 
-  if need_cmd python3; then
-    python3 - "$file" "$listen_ip" "$src_ip" "$dst_ip" <<'PY'
-import re, sys
-path, listen_ip, src_ip, dst_ip = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-txt = open(path, "r", encoding="utf-8", errors="ignore").read()
-
-def repl_first(pattern, replacement, text):
-    m = re.search(pattern, text, flags=re.M)
-    if not m:
-        return text, False
-    return re.sub(pattern, replacement, text, count=1, flags=re.M), True
-
-txt, _ = repl_first(r'^(\s*listen_ip:\s*)(".*?"|\S+)\s*$', rf'\1"{listen_ip}"', txt)
-txt, _ = repl_first(r'^(\s*src_ip:\s*)(".*?"|\S+)\s*$',    rf'\1"{src_ip}"',    txt)
-txt, _ = repl_first(r'^(\s*dst_ip:\s*)(".*?"|\S+)\s*$',    rf'\1"{dst_ip}"',    txt)
-
-open(path, "w", encoding="utf-8").write(txt)
-PY
+  if grep -qE "^[[:space:]]*${key}:" "$file"; then
+    sed -i -E "s|^([[:space:]]*${key}:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*|\1 ${val}|" "$file"
   else
-    sed -i -E "s/^([[:space:]]*listen_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+)[[:space:]]*$/\1 \"${listen_ip}\"/" "$file" || true
-    sed -i -E "s/^([[:space:]]*src_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+)[[:space:]]*$/\1 \"${src_ip}\"/" "$file" || true
-    sed -i -E "s/^([[:space:]]*dst_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+)[[:space:]]*$/\1 \"${dst_ip}\"/" "$file" || true
+    # append at end if not found
+    echo "" >> "$file"
+    echo "${key}: ${val}" >> "$file"
   fi
 }
 
-# NEW BEHAVIOR:
-# - listen_ip default = auto server IP (always)
-# - src_ip    default = auto server IP (always)
-# - show current config values too
-# - Enter => auto IP (even if config currently has something else)
-# - dst_ip: show current and Enter keeps current; if missing, require input
-configure_interactive() {
+# -------------------------
+# Install / Update
+# -------------------------
+install_files() {
+  require_root
+  sync_repo
+
+  [ -f "$REPO_DIR/bifrost" ] || { err "bifrost binary not found in repo."; exit 1; }
+  [ -d "$REPO_DIR/configs" ] || { warn "configs/ not found in repo; creating empty configs dir."; }
+
+  say "Installing files to ${INSTALL_DIR} ..."
+  mkdir -p "$INSTALL_DIR"
+  install -m 0755 "$REPO_DIR/bifrost" "$BIN_PATH"
+
+  rm -rf "$CONFIG_DIR"
   mkdir -p "$CONFIG_DIR"
-
-  local auto_ip
-  auto_ip="$(get_public_ip)"
-  if [ -z "$auto_ip" ]; then
-    echo "WARNING: Could not detect server public IP automatically."
+  if [ -d "$REPO_DIR/configs" ]; then
+    cp -R "$REPO_DIR/configs/." "$CONFIG_DIR/"
   fi
 
-  local current_listen current_src current_dst current_address current_protocol
-  current_listen="$(read_config_value "listen_ip" "$CONFIG_FILE")"
-  current_src="$(read_config_value "src_ip" "$CONFIG_FILE")"
-  current_dst="$(read_config_value "dst_ip" "$CONFIG_FILE")"
-  current_address="$(read_config_value "address" "$CONFIG_FILE")"
-  current_protocol="$(read_config_value "protocol" "$CONFIG_FILE")"
-
-  echo
-  echo "Configuration will be written to:"
-  echo "  $CONFIG_FILE"
-  echo
-
-  # ---- Location -> address ----
-  echo "Server location:"
-  echo "1) Iran      (address: 10.10.0.1/24)"
-  echo "2) Outside   (address: 10.10.0.2/24)"
-  while true; do
-    read -rp "Choose (1/2): " location </dev/tty || true
-    case "${location:-}" in
-      1) address="10.10.0.1/24"; break;;
-      2) address="10.10.0.2/24"; break;;
-      *) echo "Invalid choice. Enter 1 or 2.";;
-    esac
-  done
-
-  # ---- listen_ip (Enter = auto) ----
-  while true; do
-    if [ -n "$auto_ip" ]; then
-      if [ -n "$current_listen" ]; then
-        read -rp "listen_ip [auto: ${auto_ip}] (current: ${current_listen}) (Enter = auto): " in_listen </dev/tty || true
-      else
-        read -rp "listen_ip [auto: ${auto_ip}] (Enter = auto): " in_listen </dev/tty || true
-      fi
-      listen_ip="${in_listen:-$auto_ip}"
-    else
-      read -rp "listen_ip (required): " listen_ip </dev/tty
-    fi
-    [ -n "${listen_ip:-}" ] && break
-    echo "listen_ip cannot be empty."
-  done
-
-  # ---- src_ip (Enter = auto) ----
-  while true; do
-    if [ -n "$auto_ip" ]; then
-      if [ -n "$current_src" ]; then
-        read -rp "src_ip [auto: ${auto_ip}] (current: ${current_src}) (Enter = auto): " in_src </dev/tty || true
-      else
-        read -rp "src_ip [auto: ${auto_ip}] (Enter = auto): " in_src </dev/tty || true
-      fi
-      src_ip="${in_src:-$auto_ip}"
-    else
-      read -rp "src_ip (required): " src_ip </dev/tty
-    fi
-    [ -n "${src_ip:-}" ] && break
-    echo "src_ip cannot be empty."
-  done
-
-  # ---- dst_ip (Enter = keep current if exists) ----
-  if [ -n "$current_dst" ]; then
-    read -rp "dst_ip (current: ${current_dst}) (Enter = keep current): " in_dst </dev/tty || true
-    dst_ip="${in_dst:-$current_dst}"
-  else
-    while true; do
-      read -rp "dst_ip (required): " dst_ip </dev/tty
-      [ -n "$dst_ip" ] && break
-      echo "dst_ip cannot be empty."
-    done
-  fi
-
-  # ---- protocol (Enter = keep current if exists, else default 58) ----
-  if [ -n "$current_protocol" ]; then
-    read -rp "protocol (current: ${current_protocol}) (Enter = keep current): " in_proto </dev/tty || true
-    protocol="${in_proto:-$current_protocol}"
-  else
-    read -rp "protocol [default: 58]: " in_proto </dev/tty || true
-    protocol="${in_proto:-58}"
-  fi
-
-  echo
-  echo "Applying:"
-  echo "  address   = $address"
-  echo "  listen_ip = $listen_ip"
-  echo "  src_ip    = $src_ip"
-  echo "  dst_ip    = $dst_ip"
-  echo "  protocol  = $protocol"
-  echo
-
-  # Update YAML (simple replace; assumes each key exists once)
-  sed -i -E "s/^([[:space:]]*address:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${address}\"/" "$CONFIG_FILE" || true
-  sed -i -E "s/^([[:space:]]*listen_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${listen_ip}\"/" "$CONFIG_FILE" || true
-  sed -i -E "s/^([[:space:]]*src_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${src_ip}\"/" "$CONFIG_FILE" || true
-  sed -i -E "s/^([[:space:]]*dst_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${dst_ip}\"/" "$CONFIG_FILE" || true
-  sed -i -E "s/^([[:space:]]*protocol:)[[:space:]]*([0-9]+).*/\1 ${protocol}/" "$CONFIG_FILE" || true
+  ok "Files installed."
 }
+
 install_systemd_service() {
+  require_root
+  say "Installing systemd service (runs as root)..."
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Bifrost Service
@@ -285,7 +216,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/bifrost ${CONFIG_FILE}
+ExecStart=${BIN_PATH} ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=2
 StandardOutput=journal
@@ -296,69 +227,219 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
+  systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  ok "systemd service installed."
 }
 
-install_or_update() {
+# -------------------------
+# Configuration (interactive)
+# -------------------------
+choose_location_address() {
+  # Fix for your issue: strict loop until valid choice
+  while true; do
+    echo
+    say "Server location:"
+    say "  1) Iran        -> address: ${ADDRESS_IR}"
+    say "  2) Outside Iran-> address: ${ADDRESS_OUT}"
+    read -rp "Choose (1/2): " loc </dev/tty || true
+    case "${loc:-}" in
+      1) echo "$ADDRESS_IR"; return 0;;
+      2) echo "$ADDRESS_OUT"; return 0;;
+      *) warn "Invalid choice. Please enter 1 or 2.";;
+    esac
+  done
+}
+
+configure_interactive() {
   require_root
-  echo "Syncing repository..."
-  sync_repo
 
-  echo "Ensuring system user..."
-  ensure_user
+  [ -f "$CONFIG_FILE" ] || { err "Config file not found: $CONFIG_FILE"; return 1; }
 
-  echo "Installing files..."
-  mkdir -p "$INSTALL_DIR"
-  install -m 0755 "$REPO_DIR/bifrost" "${INSTALL_DIR}/bifrost"
+  local auto_ip
+  auto_ip="$(get_public_ip)"
+  [ -n "$auto_ip" ] || warn "Could not detect server IP automatically. You must enter listen_ip/src_ip."
 
-  rm -rf "${INSTALL_DIR}/configs"
-  if [ -d "$REPO_DIR/configs" ]; then
-    cp -R "$REPO_DIR/configs" "${INSTALL_DIR}/configs"
+  local cur_listen cur_src cur_dst cur_addr cur_proto
+  cur_listen="$(read_yaml_value "listen_ip" "$CONFIG_FILE")"
+  cur_src="$(read_yaml_value "src_ip" "$CONFIG_FILE")"
+  cur_dst="$(read_yaml_value "dst_ip" "$CONFIG_FILE")"
+  cur_addr="$(read_yaml_value "address" "$CONFIG_FILE")"
+  cur_proto="$(read_yaml_value "protocol" "$CONFIG_FILE")"
+
+  say
+  say "Config file:"
+  say "  ${CONFIG_FILE}"
+  say "$HR"
+  [ -n "$cur_addr" ]   && say "Current address:   $cur_addr"
+  [ -n "$cur_listen" ] && say "Current listen_ip: $cur_listen"
+  [ -n "$cur_src" ]    && say "Current src_ip:    $cur_src"
+  [ -n "$cur_dst" ]    && say "Current dst_ip:    $cur_dst"
+  [ -n "$cur_proto" ]  && say "Current protocol:  $cur_proto"
+  say "$HR"
+
+  backup_config
+
+  # address based on location
+  local address
+  address="$(choose_location_address)"
+
+  # listen_ip default = auto ip (Enter => auto)
+  local listen_ip
+  while true; do
+    if [ -n "$auto_ip" ]; then
+      read -rp "listen_ip [auto: ${auto_ip}] (Enter = auto): " in_listen </dev/tty || true
+      listen_ip="${in_listen:-$auto_ip}"
+    else
+      read -rp "listen_ip (required): " listen_ip </dev/tty || true
+    fi
+    [ -n "${listen_ip:-}" ] && break
+    warn "listen_ip cannot be empty."
+  done
+
+  # src_ip default = auto ip (Enter => auto)
+  local src_ip
+  while true; do
+    if [ -n "$auto_ip" ]; then
+      read -rp "src_ip [auto: ${auto_ip}] (Enter = auto): " in_src </dev/tty || true
+      src_ip="${in_src:-$auto_ip}"
+    else
+      read -rp "src_ip (required): " src_ip </dev/tty || true
+    fi
+    [ -n "${src_ip:-}" ] && break
+    warn "src_ip cannot be empty."
+  done
+
+  # dst_ip: keep current on Enter if exists; otherwise require
+  local dst_ip
+  if [ -n "$cur_dst" ]; then
+    read -rp "dst_ip (current: ${cur_dst}) (Enter = keep current): " in_dst </dev/tty || true
+    dst_ip="${in_dst:-$cur_dst}"
   else
-    mkdir -p "${INSTALL_DIR}/configs"
+    while true; do
+      read -rp "dst_ip (required): " dst_ip </dev/tty || true
+      [ -n "${dst_ip:-}" ] && break
+      warn "dst_ip cannot be empty."
+    done
   fi
 
-  chown -R "${APP_USER}:${APP_USER}" "$INSTALL_DIR"
+  # protocol: keep current on Enter if exists, else default 58
+  local protocol
+  if [ -n "$cur_proto" ]; then
+    read -rp "protocol (current: ${cur_proto}) (Enter = keep current): " in_proto </dev/tty || true
+    protocol="${in_proto:-$cur_proto}"
+  else
+    read -rp "protocol [default: 58]: " in_proto </dev/tty || true
+    protocol="${in_proto:-58}"
+  fi
 
-  echo "Configuring (listen_ip, src_ip, dst_ip)..."
-  configure_interactive
+  say
+  ok "Applying configuration:"
+  say "  address   = $address"
+  say "  listen_ip = $listen_ip"
+  say "  src_ip    = $src_ip"
+  say "  dst_ip    = $dst_ip"
+  say "  protocol  = $protocol"
+  say
 
-  echo "Installing systemd service..."
-  install_systemd_service
+  # write into yaml (set or add if missing)
+  set_yaml_kv "address"   "$address"   "$CONFIG_FILE" "yes"
+  set_yaml_kv "listen_ip" "$listen_ip" "$CONFIG_FILE" "yes"
+  set_yaml_kv "src_ip"    "$src_ip"    "$CONFIG_FILE" "yes"
+  set_yaml_kv "dst_ip"    "$dst_ip"    "$CONFIG_FILE" "yes"
+  set_yaml_kv "protocol"  "$protocol"  "$CONFIG_FILE" "no"
 
-  echo
-  echo "Done. Service status:"
-  systemctl --no-pager status "$SERVICE_NAME" || true
+  ok "Config updated."
 }
 
-start_service() { require_root; systemctl start "$SERVICE_NAME"; }
-stop_service() { require_root; systemctl stop "$SERVICE_NAME"; }
-restart_service(){ require_root; systemctl restart "$SERVICE_NAME"; }
+edit_config_in_nano() {
+  require_root
+  if [ ! -f "$CONFIG_FILE" ]; then
+    err "Config file not found: $CONFIG_FILE"
+    return 1
+  fi
 
-show_logs() {
-  echo "Press Ctrl+C to exit logs."
+  backup_config
+  nano "$CONFIG_FILE"
+
+  echo
+  read -rp "Restart service now? (y/N): " ans </dev/tty || true
+  case "${ans:-N}" in
+    y|Y)
+      systemctl restart "$SERVICE_NAME" || true
+      systemctl --no-pager status "$SERVICE_NAME" || true
+      ;;
+    *) ;;
+  esac
+}
+
+# -------------------------
+# Actions
+# -------------------------
+action_install_update() {
+  require_root
+  say "$HR"
+  say "Install / Update"
+  say "$HR"
+  install_files
+  configure_interactive
+  install_systemd_service
+  systemctl reset-failed "$SERVICE_NAME" || true
+  systemctl restart "$SERVICE_NAME" || true
+  echo
+  systemctl --no-pager status "$SERVICE_NAME" || true
+  pause
+}
+
+action_config_only() {
+  require_root
+  say "$HR"
+  say "Configure Only (no reinstall)"
+  say "$HR"
+  configure_interactive
+  systemctl reset-failed "$SERVICE_NAME" || true
+  systemctl restart "$SERVICE_NAME" || true
+  echo
+  systemctl --no-pager status "$SERVICE_NAME" || true
+  pause
+}
+
+action_start()   { require_root; systemctl start "$SERVICE_NAME" || true; systemctl --no-pager status "$SERVICE_NAME" || true; pause; }
+action_stop()    { require_root; systemctl stop "$SERVICE_NAME" || true; systemctl --no-pager status "$SERVICE_NAME" || true; pause; }
+action_restart() { require_root; systemctl reset-failed "$SERVICE_NAME" || true; systemctl restart "$SERVICE_NAME" || true; systemctl --no-pager status "$SERVICE_NAME" || true; pause; }
+
+action_status() {
+  require_root
+  systemctl --no-pager status "$SERVICE_NAME" || true
+  pause
+}
+
+action_logs() {
+  require_root
+  say "Press Ctrl+C to exit logs."
   journalctl -u "$SERVICE_NAME" -f
 }
 
-show_config_summary() {
+action_show_config_summary() {
+  require_root
   echo
-  echo "Installed config file:"
-  echo "  $CONFIG_FILE"
+  say "Config file: $CONFIG_FILE"
   if [ -f "$CONFIG_FILE" ]; then
     echo
-    echo "Current values:"
-    echo "  listen_ip: $(read_config_value "listen_ip" "$CONFIG_FILE")"
-    echo "  src_ip:    $(read_config_value "src_ip" "$CONFIG_FILE")"
-    echo "  dst_ip:    $(read_config_value "dst_ip" "$CONFIG_FILE")"
+    say "address:   $(read_yaml_value address "$CONFIG_FILE")"
+    say "listen_ip: $(read_yaml_value listen_ip "$CONFIG_FILE")"
+    say "src_ip:    $(read_yaml_value src_ip "$CONFIG_FILE")"
+    say "dst_ip:    $(read_yaml_value dst_ip "$CONFIG_FILE")"
+    say "protocol:  $(read_yaml_value protocol "$CONFIG_FILE")"
   else
-    echo "Config file not found."
+    err "Config not found."
   fi
   pause
 }
 
-uninstall_all() {
+action_uninstall() {
   require_root
-  echo "This will remove the service and all installed files:"
+  echo
+  warn "This will remove service + installed files:"
   echo "  - $SERVICE_FILE"
   echo "  - $INSTALL_DIR"
   echo "  - $REPO_DIR"
@@ -366,7 +447,7 @@ uninstall_all() {
   read -rp "Continue? (y/N): " ans </dev/tty || true
   case "${ans:-N}" in
     y|Y) ;;
-    *) echo "Cancelled."; return;;
+    *) ok "Cancelled."; return;;
   esac
 
   systemctl stop "$SERVICE_NAME" || true
@@ -376,47 +457,49 @@ uninstall_all() {
   systemctl reset-failed || true
 
   rm -rf "$INSTALL_DIR" "$REPO_DIR" || true
-
-  read -rp "Remove system user '${APP_USER}'? (y/N): " rmuser </dev/tty || true
-  case "${rmuser:-N}" in
-    y|Y) id -u "$APP_USER" >/dev/null 2>&1 && userdel "$APP_USER" || true ;;
-  esac
-
-  echo "Uninstall complete."
+  ok "Uninstall complete."
+  pause
 }
 
+# -------------------------
+# Menu
+# -------------------------
 menu() {
   while true; do
     clear || true
-    echo "================================"
-    echo "          Bifrost Manager"
-    echo "================================"
+    echo "========================================"
+    echo "              Bifrost Manager"
+    echo "========================================"
     echo "Repo:    $REPO ($BRANCH)"
     echo "Status:  $(service_status_short)"
     echo "Version: $(current_version)"
-    echo "--------------------------------"
-    echo "1) Install / Update"
-    echo "2) Start"
-    echo "3) Stop"
-    echo "4) Restart"
-    echo "5) Show Status"
-    echo "6) Show Logs"
-    echo "7) Show Config Summary"
-    echo "8) Uninstall"
+    echo "$HR"
+    echo "1) Install / Update (full)"
+    echo "2) Configure only (no reinstall)"
+    echo "3) Edit full config in nano"
+    echo "4) Start"
+    echo "5) Stop"
+    echo "6) Restart"
+    echo "7) Show status"
+    echo "8) Show logs"
+    echo "9) Show config summary"
+    echo "10) Uninstall"
     echo "0) Exit"
-    echo "--------------------------------"
+    echo "$HR"
     read -rp "Choose: " choice </dev/tty || true
     case "$choice" in
-      1) install_or_update; pause;;
-      2) start_service; pause;;
-      3) stop_service; pause;;
-      4) restart_service; pause;;
-      5) systemctl --no-pager status "$SERVICE_NAME" || true; pause;;
-      6) show_logs;;
-      7) show_config_summary;;
-      8) uninstall_all; pause;;
+      1) action_install_update;;
+      2) action_config_only;;
+      3) edit_config_in_nano;;
+      4) action_start;;
+      5) action_stop;;
+      6) action_restart;;
+      7) action_status;;
+      8) action_logs;;
+      9) action_show_config_summary;;
+      10) action_uninstall;;
       0) exit 0;;
-      *) echo "Invalid option"; pause;;
+      *) warn "Invalid option"; pause;;
     esac
   done
 }
