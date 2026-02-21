@@ -253,8 +253,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=${APP_USER}
-Group=${APP_USER}
+User=root
+Group=root
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/bifrost ${CONFIG_FILE}
 Restart=on-failure
