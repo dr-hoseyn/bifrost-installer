@@ -178,20 +178,34 @@ configure_interactive() {
   auto_ip="$(get_public_ip)"
   if [ -z "$auto_ip" ]; then
     echo "WARNING: Could not detect server public IP automatically."
-    echo "You must enter listen_ip and src_ip manually."
   fi
 
-  local current_listen current_src current_dst
+  local current_listen current_src current_dst current_address current_protocol
   current_listen="$(read_config_value "listen_ip" "$CONFIG_FILE")"
   current_src="$(read_config_value "src_ip" "$CONFIG_FILE")"
   current_dst="$(read_config_value "dst_ip" "$CONFIG_FILE")"
+  current_address="$(read_config_value "address" "$CONFIG_FILE")"
+  current_protocol="$(read_config_value "protocol" "$CONFIG_FILE")"
 
   echo
   echo "Configuration will be written to:"
   echo "  $CONFIG_FILE"
   echo
 
-  # listen_ip
+  # ---- Location -> address ----
+  echo "Server location:"
+  echo "1) Iran      (address: 10.10.0.1/24)"
+  echo "2) Outside   (address: 10.10.0.2/24)"
+  while true; do
+    read -rp "Choose (1/2): " location </dev/tty || true
+    case "${location:-}" in
+      1) address="10.10.0.1/24"; break;;
+      2) address="10.10.0.2/24"; break;;
+      *) echo "Invalid choice. Enter 1 or 2.";;
+    esac
+  done
+
+  # ---- listen_ip (Enter = auto) ----
   while true; do
     if [ -n "$auto_ip" ]; then
       if [ -n "$current_listen" ]; then
@@ -207,7 +221,7 @@ configure_interactive() {
     echo "listen_ip cannot be empty."
   done
 
-  # src_ip
+  # ---- src_ip (Enter = auto) ----
   while true; do
     if [ -n "$auto_ip" ]; then
       if [ -n "$current_src" ]; then
@@ -223,7 +237,7 @@ configure_interactive() {
     echo "src_ip cannot be empty."
   done
 
-  # dst_ip (required; default = current if present)
+  # ---- dst_ip (Enter = keep current if exists) ----
   if [ -n "$current_dst" ]; then
     read -rp "dst_ip (current: ${current_dst}) (Enter = keep current): " in_dst </dev/tty || true
     dst_ip="${in_dst:-$current_dst}"
@@ -235,16 +249,31 @@ configure_interactive() {
     done
   fi
 
+  # ---- protocol (Enter = keep current if exists, else default 58) ----
+  if [ -n "$current_protocol" ]; then
+    read -rp "protocol (current: ${current_protocol}) (Enter = keep current): " in_proto </dev/tty || true
+    protocol="${in_proto:-$current_protocol}"
+  else
+    read -rp "protocol [default: 58]: " in_proto </dev/tty || true
+    protocol="${in_proto:-58}"
+  fi
+
   echo
   echo "Applying:"
+  echo "  address   = $address"
   echo "  listen_ip = $listen_ip"
   echo "  src_ip    = $src_ip"
   echo "  dst_ip    = $dst_ip"
+  echo "  protocol  = $protocol"
   echo
 
-  update_config_keys "$CONFIG_FILE" "$listen_ip" "$src_ip" "$dst_ip"
+  # Update YAML (simple replace; assumes each key exists once)
+  sed -i -E "s/^([[:space:]]*address:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${address}\"/" "$CONFIG_FILE" || true
+  sed -i -E "s/^([[:space:]]*listen_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${listen_ip}\"/" "$CONFIG_FILE" || true
+  sed -i -E "s/^([[:space:]]*src_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${src_ip}\"/" "$CONFIG_FILE" || true
+  sed -i -E "s/^([[:space:]]*dst_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+).*/\1 \"${dst_ip}\"/" "$CONFIG_FILE" || true
+  sed -i -E "s/^([[:space:]]*protocol:)[[:space:]]*([0-9]+).*/\1 ${protocol}/" "$CONFIG_FILE" || true
 }
-
 install_systemd_service() {
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
