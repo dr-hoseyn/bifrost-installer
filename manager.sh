@@ -271,15 +271,16 @@ EOF
 # -------------------------
 choose_location_address() {
   while true; do
-    echo
-    say "Server location:"
-    say "  1) Iran        -> address: ${ADDRESS_IR}"
-    say "  2) Outside Iran-> address: ${ADDRESS_OUT}"
+    echo "" > /dev/tty
+    echo "Server location:" > /dev/tty
+    echo "  1) Iran        -> address: ${ADDRESS_IR}" > /dev/tty
+    echo "  2) Outside Iran-> address: ${ADDRESS_OUT}" > /dev/tty
     read -rp "Choose (1/2): " loc </dev/tty || true
+
     case "${loc:-}" in
-      1) echo "$ADDRESS_IR"; return 0 ;;
-      2) echo "$ADDRESS_OUT"; return 0 ;;
-      *) warn "Invalid choice. Enter 1 or 2." ;;
+      1) echo "${ADDRESS_IR}"; return 0 ;;
+      2) echo "${ADDRESS_OUT}"; return 0 ;;
+      *) echo "Invalid choice. Enter 1 or 2." > /dev/tty ;;
     esac
   done
 }
@@ -317,6 +318,7 @@ configure_interactive() {
   # address from location
   local address
   address="$(choose_location_address)"
+  address="$(echo "$address" | tr -d '\r\n')"
 
   # listen_ip (Enter = auto)
   local listen_ip in_listen
