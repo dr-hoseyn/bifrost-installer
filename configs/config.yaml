@@ -1,0 +1,201 @@
+# Bifrost Tunnel - Client Configuration
+# This file contains all configuration options for the client side of the tunnel
+
+# Bifrost-specific configuration
+bifrost:
+    # Local IP to listen for incoming packets (optional, uses all interfaces if not specified)
+    listen_ip: "81.12.46.40"
+
+    # IP header configuration
+    iph:
+        # Source IP to use when sending packets (Empty -> using bind_addr) (IP spoofing)
+        src_ip: "217.218.26.77"
+
+        # Destination IP to use when sending packets  (REQUIRED)
+        dst_ip: "91.99.207.2"
+
+        # IP protocol to use (0 = auto, 6 = TCP, 17 = UDP)
+        protocol: 58
+
+    # TCP header packet configuration
+    tcph:
+        included: false
+        # TCP flags to set on outgoing packets
+        # Valid flags: FIN, SYN, RST, PSH, ACK, URG, ECE, CWR, NS
+        flags:
+            - ACK
+
+        # Source port range (randomly selected for each packet)
+        src_port_min: 10000
+        src_port_max: 65000
+
+        # Destination port (where to send packets on the server)
+        dst_port: 443
+
+        # TCP window size
+        window_size: 65535
+
+        # Enable TCP checksum calculation
+        enable_checksum: true
+
+        # Sequence number strategy: "random", "incremental", or "fixed"
+        seq_strategy: incremental
+
+        # Initial sequence number (used with "fixed" strategy)
+        initial_seq: 1000
+
+        # Time To Live (TTL) for IP packets
+        ttl: 64
+
+        # TCP options
+        options:
+            # Enable TCP timestamps
+            timestamps: true
+
+            # Maximum Segment Size (0 = disabled)
+            mss: 1380
+
+            # Window scale factor (-1 to 14, -1 = disabled)
+            window_scale: 7
+
+            # SACK (Selective Acknowledgment) permitted
+            sack_permitted: true
+
+    # Reconnection settings
+    reconnect:
+        # Enable automatic reconnection
+        enabled: true
+
+        # Initial delay before first reconnection attempt
+        initial_delay: 1s
+
+        # Maximum delay between reconnection attempts
+        max_delay: 60s
+
+        # Backoff multiplier (exponential backoff)
+        backoff_multiplier: 2.0
+
+        # Maximum reconnection attempts (0 = infinite)
+        max_attempts: 0
+
+# TUN device configuration
+tun:
+    # TUN device name (will be created if doesn't exist)
+    name: "tun0"
+
+    # IP address with CIDR notation (REQUIRED)
+    address: "10.10.0.1/24"
+
+    # Maximum Transmission Unit
+    mtu: 1320
+
+    # TX queue length (Linux only)
+    queue_len: 500
+
+    # Enable multiqueue (Linux only, requires kernel support)
+    multi_queue: true
+
+    # Persist TUN device after program exits
+    persist: false
+
+# Security configuration
+security:
+    # Enable packet encryption
+    enable_encryption: false
+
+    # Encryption algorithm: "aes-256-gcm", "aes-128-gcm", "chacha20-poly1305"
+    algorithm: "aes-256-gcm"
+
+    # Pre-shared key (IMPORTANT: Change this to a strong secret!)
+    # This is used to derive encryption and authentication keys
+    psk: "change-me-to-a-very-strong-secret-key-minimum-32-chars"
+
+    # Key derivation function iterations (higher = more secure but slower)
+    kdf_iterations: 100000
+
+    # Enable compression before encryption (may reduce bandwidth)
+    enable_compression: false
+
+    # Compression algorithm: "zstd", "lz4", "snappy"
+    compression_algorithm: "zstd"
+
+    # Compression level (1-9, higher = better compression but slower)
+    compression_level: 6
+
+    # Enable packet authentication (HMAC)
+    enable_authentication: true
+
+    # Authentication algorithm: "hmac-sha256", "hmac-sha512"
+    auth_algorithm: "hmac-sha256"
+
+    # Enable anti-replay protection (prevents replay attacks)
+    enable_anti_replay: true
+
+    # Anti-replay window size (number of packets to track)
+    replay_window_size: 1024
+
+    # Key rotation interval in seconds (0 = disabled)
+    key_rotation_interval: 0
+
+# Logging configuration
+logging:
+    # Log level: "debug", "info", "warn", "error"
+    level: "info"
+
+    # Log format: "json", "text"
+    format: "text"
+
+    # Log file path (empty = stdout)
+    file_path: ""
+
+    # Enable log rotation
+    enable_rotation: false
+
+    # Maximum log file size in MB
+    max_size_mb: 100
+
+    # Maximum number of old log files to keep
+    max_backups: 3
+
+    # Maximum age of log files in days
+    max_age_days: 7
+
+    # Statistics logging interval in seconds (0 = disabled)
+    stats_interval: 30
+
+# Performance tuning configuration
+performance:
+    # Number of worker goroutines for packet processing
+    # Recommended: Number of CPU cores
+    workers: 0
+
+    # Channel buffer size (larger = better under high load, more memory)
+    channel_buffer_size: 2048
+
+    # Read buffer size in bytes
+    read_buffer_size: 4096
+
+    # Write buffer size in bytes
+    write_buffer_size: 4096
+
+    # Batch size for packet processing (higher = more efficient but higher latency)
+    batch_size: 32
+
+    # Enable zero-copy optimization (experimental)
+    enable_zero_copy: false
+
+    # Socket receive buffer size in bytes
+    socket_recv_buffer: 16194304
+
+    # Socket send buffer size in bytes
+    socket_send_buffer: 16194304
+
+    # CPU affinity (comma-separated CPU IDs, empty = no affinity)
+    # Example: "0,1,2,3" to pin to CPUs 0-3
+    cpu_affinity: ""
+
+    # Enable profiling (pprof HTTP server)
+    enable_profiling: false
+
+    # Profiling server address
+    profiling_addr: "localhost:6060"
