@@ -69,16 +69,14 @@ ensure_deps() {
     apt-get install -y git
   fi
 
-  # used for auto public ip (tries curl/wget/dig)
+  # for auto public ip (tries curl/wget/dig)
   if ! need_cmd curl && ! need_cmd wget; then
     apt-get update -y
     apt-get install -y curl
   fi
 
-  if ! need_cmd python3; then
-    # optional; script falls back if python3 missing
-    true
-  fi
+  # python3 optional (safer editing); sed fallback exists
+  true
 }
 
 sync_repo() {
@@ -112,12 +110,10 @@ get_public_ip() {
   if [ -z "$ip" ] && need_cmd dig; then
     ip="$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | tail -n 1 || true)"
   fi
-
-  # last resort: local outward interface IP (not public NAT IP)
+  # last resort: outward interface IP (might be private)
   if [ -z "$ip" ] && need_cmd ip; then
     ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1 || true)"
   fi
-
   echo "$ip"
 }
 
@@ -129,11 +125,10 @@ read_config_value() {
     echo ""
     return
   fi
-  # grab first match, strip quotes/spaces
   grep -E "^[[:space:]]*${key}:" "$file" | head -n 1 | sed -E 's/^[[:space:]]*[^:]+:[[:space:]]*//; s/"//g; s/[[:space:]]+$//'
 }
 
-# Update YAML keys (listen_ip/src_ip/dst_ip). Prefer python3 for safer replacement.
+# Update YAML keys (listen_ip/src_ip/dst_ip).
 update_config_keys() {
   local file="$1"
   local listen_ip="$2"
@@ -148,7 +143,6 @@ update_config_keys() {
   if need_cmd python3; then
     python3 - "$file" "$listen_ip" "$src_ip" "$dst_ip" <<'PY'
 import re, sys
-
 path, listen_ip, src_ip, dst_ip = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 txt = open(path, "r", encoding="utf-8", errors="ignore").read()
 
@@ -158,67 +152,82 @@ def repl_first(pattern, replacement, text):
         return text, False
     return re.sub(pattern, replacement, text, count=1, flags=re.M), True
 
-# listen_ip anywhere
 txt, _ = repl_first(r'^(\s*listen_ip:\s*)(".*?"|\S+)\s*$', rf'\1"{listen_ip}"', txt)
-
-# src_ip and dst_ip anywhere (assumes unique keys; typical for this config)
-txt, _ = repl_first(r'^(\s*src_ip:\s*)(".*?"|\S+)\s*$',   rf'\1"{src_ip}"', txt)
-txt, _ = repl_first(r'^(\s*dst_ip:\s*)(".*?"|\S+)\s*$',   rf'\1"{dst_ip}"', txt)
+txt, _ = repl_first(r'^(\s*src_ip:\s*)(".*?"|\S+)\s*$',    rf'\1"{src_ip}"',    txt)
+txt, _ = repl_first(r'^(\s*dst_ip:\s*)(".*?"|\S+)\s*$',    rf'\1"{dst_ip}"',    txt)
 
 open(path, "w", encoding="utf-8").write(txt)
 PY
   else
-    # sed fallback (less safe, but works if keys appear once)
     sed -i -E "s/^([[:space:]]*listen_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+)[[:space:]]*$/\1 \"${listen_ip}\"/" "$file" || true
     sed -i -E "s/^([[:space:]]*src_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+)[[:space:]]*$/\1 \"${src_ip}\"/" "$file" || true
     sed -i -E "s/^([[:space:]]*dst_ip:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+)[[:space:]]*$/\1 \"${dst_ip}\"/" "$file" || true
   fi
 }
 
+# NEW BEHAVIOR:
+# - listen_ip default = auto server IP (always)
+# - src_ip    default = auto server IP (always)
+# - show current config values too
+# - Enter => auto IP (even if config currently has something else)
+# - dst_ip: show current and Enter keeps current; if missing, require input
 configure_interactive() {
   mkdir -p "$CONFIG_DIR"
 
   local auto_ip
   auto_ip="$(get_public_ip)"
-  [ -n "$auto_ip" ] || auto_ip=""
+  if [ -z "$auto_ip" ]; then
+    echo "WARNING: Could not detect server public IP automatically."
+    echo "You must enter listen_ip and src_ip manually."
+  fi
 
   local current_listen current_src current_dst
   current_listen="$(read_config_value "listen_ip" "$CONFIG_FILE")"
   current_src="$(read_config_value "src_ip" "$CONFIG_FILE")"
   current_dst="$(read_config_value "dst_ip" "$CONFIG_FILE")"
 
-  # Defaults:
-  # - if config already has value, show it as current
-  # - otherwise suggest auto_ip for listen/src (if available)
-  local default_listen default_src default_dst
-  default_listen="${current_listen:-$auto_ip}"
-  default_src="${current_src:-$auto_ip}"
-  default_dst="${current_dst:-}"
-
   echo
   echo "Configuration will be written to:"
   echo "  $CONFIG_FILE"
   echo
 
-  if [ -n "$default_listen" ]; then
-    read -rp "listen_ip [default: ${default_listen}]: " in_listen </dev/tty || true
-    listen_ip="${in_listen:-$default_listen}"
-  else
-    read -rp "listen_ip (enter an IPv4 address): " listen_ip </dev/tty
-  fi
+  # listen_ip
+  while true; do
+    if [ -n "$auto_ip" ]; then
+      if [ -n "$current_listen" ]; then
+        read -rp "listen_ip [auto: ${auto_ip}] (current: ${current_listen}) (Enter = auto): " in_listen </dev/tty || true
+      else
+        read -rp "listen_ip [auto: ${auto_ip}] (Enter = auto): " in_listen </dev/tty || true
+      fi
+      listen_ip="${in_listen:-$auto_ip}"
+    else
+      read -rp "listen_ip (required): " listen_ip </dev/tty
+    fi
+    [ -n "${listen_ip:-}" ] && break
+    echo "listen_ip cannot be empty."
+  done
 
-  if [ -n "$default_src" ]; then
-    read -rp "src_ip [default: ${default_src}]: " in_src </dev/tty || true
-    src_ip="${in_src:-$default_src}"
-  else
-    read -rp "src_ip (enter an IPv4 address): " src_ip </dev/tty
-  fi
+  # src_ip
+  while true; do
+    if [ -n "$auto_ip" ]; then
+      if [ -n "$current_src" ]; then
+        read -rp "src_ip [auto: ${auto_ip}] (current: ${current_src}) (Enter = auto): " in_src </dev/tty || true
+      else
+        read -rp "src_ip [auto: ${auto_ip}] (Enter = auto): " in_src </dev/tty || true
+      fi
+      src_ip="${in_src:-$auto_ip}"
+    else
+      read -rp "src_ip (required): " src_ip </dev/tty
+    fi
+    [ -n "${src_ip:-}" ] && break
+    echo "src_ip cannot be empty."
+  done
 
-  if [ -n "$default_dst" ]; then
-    read -rp "dst_ip [default: ${default_dst}]: " in_dst </dev/tty || true
-    dst_ip="${in_dst:-$default_dst}"
+  # dst_ip (required; default = current if present)
+  if [ -n "$current_dst" ]; then
+    read -rp "dst_ip (current: ${current_dst}) (Enter = keep current): " in_dst </dev/tty || true
+    dst_ip="${in_dst:-$current_dst}"
   else
-    # dst_ip is required if not present
     while true; do
       read -rp "dst_ip (required): " dst_ip </dev/tty
       [ -n "$dst_ip" ] && break
