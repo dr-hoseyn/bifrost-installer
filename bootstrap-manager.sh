@@ -19,4 +19,4 @@ else
 fi
 
 cd "$DIR"
-sudo bash manager.sh
+sudo bash manager.sh </dev/tty >/dev/tty 2>/dev/tty
