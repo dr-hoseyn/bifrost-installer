@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # ============================================================
-# Bifrost Manager (clean + reliable config editing)
-# - Installs/updates files from GitHub
-# - Configures YAML keys: listen_ip, src_ip, dst_ip, address, protocol
-# - Edit full config with nano
+# Bifrost Manager (pro, no backups, reliable config editing)
+# - Install/Update
+# - Configure YAML keys: listen_ip, src_ip, dst_ip, address, protocol
+# - Edit config with nano
 # - systemd runs as root (required by bifrost)
+# - Port Forwarding (Iran -> Outside 10.10.0.2) via iptables
 # ============================================================
 
 REPO="dr-hoseyn/bifrost-installer"
@@ -25,6 +26,9 @@ CONFIG_FILE="${CONFIG_DIR}/${CONFIG_FILE_NAME}"
 
 ADDRESS_IR="10.10.0.1/24"
 ADDRESS_OUT="10.10.0.2/24"
+
+# Port-forward target (Outside endpoint over tunnel)
+PF_TARGET_IP="10.10.0.2"
 
 HR="----------------------------------------"
 
@@ -156,7 +160,6 @@ for line in txt:
     m = pat.match(line)
     if m:
         val = m.group(2)
-        # strip inline comments (best effort)
         val = val.split('#', 1)[0].strip()
         if val.startswith('"') and val.endswith('"'):
             val = val[1:-1]
@@ -190,7 +193,6 @@ for line in lines:
         if m:
             indent = m.group(1)
             rest = m.group(2)
-            # keep inline comment if exists
             comment = ""
             if "#" in rest:
                 before, after = rest.split("#", 1)
@@ -202,7 +204,6 @@ for line in lines:
     new_lines.append(line)
 
 if not done:
-    # append as top-level at end (best effort)
     if len(new_lines) and not new_lines[-1].endswith("\n"):
         new_lines[-1] = new_lines[-1] + "\n"
     new_lines.append(f"\n{key}: {make_value(value)}\n")
@@ -268,18 +269,18 @@ EOF
 
 # -------------------------
 # Interactive config
+# IMPORTANT: print menu to /dev/tty (NOT stdout), so it NEVER corrupts address value
 # -------------------------
 choose_location_address() {
   while true; do
     echo "" > /dev/tty
     echo "Server location:" > /dev/tty
-    echo "  1) Iran        -> address: ${ADDRESS_IR}" > /dev/tty
-    echo "  2) Outside Iran-> address: ${ADDRESS_OUT}" > /dev/tty
+    echo "  1) Iran         -> address: ${ADDRESS_IR}" > /dev/tty
+    echo "  2) Outside Iran -> address: ${ADDRESS_OUT}" > /dev/tty
     read -rp "Choose (1/2): " loc </dev/tty || true
-
     case "${loc:-}" in
-      1) echo "${ADDRESS_IR}"; return 0 ;;
-      2) echo "${ADDRESS_OUT}"; return 0 ;;
+      1) echo "$ADDRESS_IR"; return 0 ;;
+      2) echo "$ADDRESS_OUT"; return 0 ;;
       *) echo "Invalid choice. Enter 1 or 2." > /dev/tty ;;
     esac
   done
@@ -296,7 +297,7 @@ configure_interactive() {
 
   local auto_ip cur_listen cur_src cur_dst cur_addr cur_proto
   auto_ip="$(get_public_ip)"
-  [ -n "$auto_ip" ] || warn "Could not detect server public IP automatically."
+  [ -n "$auto_ip" ] || warn "Could not detect server public public IP automatically."
 
   cur_listen="$(yaml_get_first "$CONFIG_FILE" "listen_ip")"
   cur_src="$(yaml_get_first "$CONFIG_FILE" "src_ip")"
@@ -315,7 +316,6 @@ configure_interactive() {
   [ -n "$cur_proto" ]  && say "Current protocol:  $cur_proto"
   say "$HR"
 
-  # address from location
   local address
   address="$(choose_location_address)"
   address="$(echo "$address" | tr -d '\r\n')"
@@ -378,7 +378,6 @@ configure_interactive() {
   say "  protocol  = $protocol"
   echo
 
-  # IMPORTANT: replace existing keys wherever they are (any indentation)
   yaml_set_first "$CONFIG_FILE" "address"   "$address"   "yes"
   yaml_set_first "$CONFIG_FILE" "listen_ip" "$listen_ip" "yes"
   yaml_set_first "$CONFIG_FILE" "src_ip"    "$src_ip"    "yes"
@@ -406,6 +405,225 @@ edit_config_nano() {
       ;;
     *) ;;
   esac
+}
+
+# -------------------------
+# Port Forwarding (Iran -> Outside 10.10.0.2)
+# - Asks user for ports (comma separated)
+# - Applies DNAT in PREROUTING to 10.10.0.2
+# - Adds FORWARD accept rules
+# - Adds SNAT (MASQUERADE) on tunnel interface so return path is stable
+# - Enables net.ipv4.ip_forward persistently
+# -------------------------
+pf_detect_if() {
+  # Detect external interface (default route)
+  local out_if=""
+  out_if="$(ip route show default 0.0.0.0/0 2>/dev/null | awk '{print $5}' | head -n 1 || true)"
+  [ -n "$out_if" ] || out_if="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n 1 || true)"
+  echo "$out_if"
+}
+
+pf_detect_tun_if() {
+  # Detect interface used to reach PF_TARGET_IP (10.10.0.2)
+  local tun_if=""
+  tun_if="$(ip -4 route get "${PF_TARGET_IP}" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n 1 || true)"
+  echo "$tun_if"
+}
+
+pf_enable_ip_forward() {
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  mkdir -p /etc/sysctl.d
+  cat > /etc/sysctl.d/99-bifrost-forward.conf <<EOF
+net.ipv4.ip_forward=1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+}
+
+pf_install_iptables() {
+  if ! need_cmd iptables; then
+    say "Installing iptables..."
+    apt-get update -y
+    apt-get install -y iptables
+  fi
+
+  # For persistence (optional but nice)
+  if ! need_cmd netfilter-persistent; then
+    say "Installing netfilter-persistent (to save rules)..."
+    apt-get update -y
+    apt-get install -y netfilter-persistent iptables-persistent || true
+  fi
+}
+
+pf_chain_setup() {
+  # Create chains if not exist and hook them once.
+  iptables -t nat -N BIFROST_PF 2>/dev/null || true
+  iptables -N BIFROST_PF_FWD 2>/dev/null || true
+
+  # Hook NAT PREROUTING
+  iptables -t nat -C PREROUTING -j BIFROST_PF 2>/dev/null || iptables -t nat -A PREROUTING -j BIFROST_PF
+
+  # Hook filter FORWARD
+  iptables -C FORWARD -j BIFROST_PF_FWD 2>/dev/null || iptables -A FORWARD -j BIFROST_PF_FWD
+
+  # Allow established/related in our chain
+  iptables -C BIFROST_PF_FWD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A BIFROST_PF_FWD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+}
+
+pf_clear_rules() {
+  # Flush our custom chains only (safe)
+  iptables -t nat -F BIFROST_PF 2>/dev/null || true
+  iptables -F BIFROST_PF_FWD 2>/dev/null || true
+
+  # Remove SNAT/MASQUERADE rules we add (tagged by match pattern)
+  # We avoid dangerous broad deletes; user can re-add from menu.
+  ok "Port forwarding rules cleared (chains flushed)."
+}
+
+pf_apply_ports() {
+  local out_if="$1" tun_if="$2" proto="$3" ports_csv="$4"
+
+  # sanitize ports: keep digits and commas only
+  local ports
+  ports="$(echo "$ports_csv" | tr -d ' \t\r\n' | sed 's/[^0-9,]//g')"
+
+  if [ -z "$ports" ]; then
+    err "No valid ports provided."
+    return 1
+  fi
+
+  IFS=',' read -r -a arr <<< "$ports"
+
+  for p in "${arr[@]}"; do
+    [ -n "$p" ] || continue
+    if ! echo "$p" | grep -qE '^[0-9]+$'; then
+      warn "Skipping invalid port: $p"
+      continue
+    fi
+    if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+      warn "Skipping out-of-range port: $p"
+      continue
+    fi
+
+    if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
+      # DNAT incoming TCP port to 10.10.0.2:port
+      iptables -t nat -C BIFROST_PF -i "$out_if" -p tcp --dport "$p" -j DNAT --to-destination "${PF_TARGET_IP}:${p}" 2>/dev/null || \
+        iptables -t nat -A BIFROST_PF -i "$out_if" -p tcp --dport "$p" -j DNAT --to-destination "${PF_TARGET_IP}:${p}"
+
+      # Allow forwarding to target
+      iptables -C BIFROST_PF_FWD -p tcp -d "$PF_TARGET_IP" --dport "$p" -j ACCEPT 2>/dev/null || \
+        iptables -A BIFROST_PF_FWD -p tcp -d "$PF_TARGET_IP" --dport "$p" -j ACCEPT
+
+      # SNAT on tunnel interface to keep return traffic stable (source becomes 10.10.0.1)
+      # This rule is narrow: only traffic to 10.10.0.2 and that port.
+      iptables -t nat -C POSTROUTING -o "$tun_if" -p tcp -d "$PF_TARGET_IP" --dport "$p" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$tun_if" -p tcp -d "$PF_TARGET_IP" --dport "$p" -j MASQUERADE
+    fi
+
+    if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
+      iptables -t nat -C BIFROST_PF -i "$out_if" -p udp --dport "$p" -j DNAT --to-destination "${PF_TARGET_IP}:${p}" 2>/dev/null || \
+        iptables -t nat -A BIFROST_PF -i "$out_if" -p udp --dport "$p" -j DNAT --to-destination "${PF_TARGET_IP}:${p}"
+
+      iptables -C BIFROST_PF_FWD -p udp -d "$PF_TARGET_IP" --dport "$p" -j ACCEPT 2>/dev/null || \
+        iptables -A BIFROST_PF_FWD -p udp -d "$PF_TARGET_IP" --dport "$p" -j ACCEPT
+
+      iptables -t nat -C POSTROUTING -o "$tun_if" -p udp -d "$PF_TARGET_IP" --dport "$p" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$tun_if" -p udp -d "$PF_TARGET_IP" --dport "$p" -j MASQUERADE
+    fi
+  done
+
+  # Persist rules if possible
+  if need_cmd netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+
+  ok "Port forwarding rules applied."
+}
+
+action_port_forwarding() {
+  require_root
+
+  # Check if server is configured as Iran
+  local cur_addr
+  cur_addr="$(yaml_get_first "$CONFIG_FILE" "address")"
+  if [ "$cur_addr" != "$ADDRESS_IR" ]; then
+    warn "This option is intended for IRAN server only."
+    warn "Current address in config: ${cur_addr:-<empty>}"
+    warn "Expected (Iran): $ADDRESS_IR"
+    echo
+    read -rp "Continue anyway? (y/N): " cont </dev/tty || true
+    case "${cont:-N}" in
+      y|Y) ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  pf_install_iptables
+  pf_enable_ip_forward
+
+  local out_if tun_if
+  out_if="$(pf_detect_if)"
+  tun_if="$(pf_detect_tun_if)"
+
+  if [ -z "$out_if" ]; then
+    err "Could not detect external interface (default route)."
+    return 1
+  fi
+  if [ -z "$tun_if" ]; then
+    err "Could not detect tunnel interface to reach ${PF_TARGET_IP}."
+    err "Make sure the tunnel is up and route to ${PF_TARGET_IP} exists."
+    return 1
+  fi
+
+  say
+  say "$HR"
+  say "Port Forwarding (Iran -> Outside ${PF_TARGET_IP})"
+  say "$HR"
+  say "External IF: $out_if"
+  say "Tunnel IF:   $tun_if"
+  say
+
+  echo "1) Add/Update forwarding rules" > /dev/tty
+  echo "2) Clear forwarding rules (flush BIFROST chains)" > /dev/tty
+  read -rp "Choose (1/2): " mode </dev/tty || true
+
+  case "${mode:-}" in
+    2)
+      pf_chain_setup
+      pf_clear_rules
+      if need_cmd netfilter-persistent; then netfilter-persistent save >/dev/null 2>&1 || true; fi
+      pause
+      return 0
+      ;;
+    1) ;;
+    *)
+      warn "Invalid choice."
+      pause
+      return 0
+      ;;
+  esac
+
+  pf_chain_setup
+
+  local proto ports_csv
+  while true; do
+    read -rp "Protocol (tcp/udp/both) [default: tcp]: " proto </dev/tty || true
+    proto="${proto:-tcp}"
+    case "$proto" in
+      tcp|udp|both) break ;;
+      *) warn "Enter: tcp or udp or both" ;;
+    esac
+  done
+
+  read -rp "Ports (comma separated, e.g. 80,443,8443): " ports_csv </dev/tty || true
+  if [ -z "${ports_csv:-}" ]; then
+    err "No ports provided."
+    pause
+    return 1
+  fi
+
+  pf_apply_ports "$out_if" "$tun_if" "$proto" "$ports_csv"
+  pause
 }
 
 # -------------------------
@@ -519,7 +737,8 @@ menu() {
     echo "7) Show status"
     echo "8) Show logs"
     echo "9) Show config summary"
-    echo "10) Uninstall"
+    echo "10) Port Forwarding (Iran -> Outside ${PF_TARGET_IP})"
+    echo "11) Uninstall"
     echo "0) Exit"
     echo "$HR"
     read -rp "Choose: " choice </dev/tty || true
@@ -533,7 +752,8 @@ menu() {
       7) action_status ;;
       8) action_logs ;;
       9) action_show_config_summary ;;
-      10) action_uninstall ;;
+      10) action_port_forwarding ;;
+      11) action_uninstall ;;
       0) exit 0 ;;
       *) warn "Invalid option"; pause ;;
     esac
